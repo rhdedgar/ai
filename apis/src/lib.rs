@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+#![forbid(unsafe_code)]
 #![allow(unreachable_pub, reason = "migration: visibility will be tightened")]
 
 //! AI provider API types and persistence for Praxis.
@@ -18,6 +19,7 @@ mod callout_identity;
 pub mod callout_policy;
 pub mod callout_target;
 pub mod classifier;
+pub mod crypto_readiness;
 pub mod hash;
 pub mod http_hop;
 pub mod json_body;

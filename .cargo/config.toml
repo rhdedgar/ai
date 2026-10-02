@@ -9,3 +9,7 @@ rustflags = ["-C", "force-frame-pointers=yes"]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "force-frame-pointers=yes"]
+
+# Development only: remove after the provider 0.4.2 release is available.
+[patch.crates-io]
+quixotic-plecostomus-rustls-openssl = { path = "/tmp/praxis-pingora-readiness/pingora-rustls-openssl" }

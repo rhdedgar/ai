@@ -64,25 +64,49 @@ listed in the exemption table at the end of this page.
 
 ## Startup: what praxis-ai reports and enforces
 
-At startup praxis-ai installs its one crypto provider and logs what it found:
+At startup praxis-ai installs its rustls provider and reports the effective
+process and host state after logging is initialized:
 
 ```text
-installed rustls crypto provider provider=openssl provider_fips=true kernel_fips=Some(true) fips_required=true
+installed rustls crypto provider provider="openssl" provider_fips=true kernel_fips=Observed(true) openssl_fips_properties=Observed(true) crypto_policy=Observed(Fips) fips_ready=true fips_required=true
 ```
 
-- `provider_fips`: whether OpenSSL's default properties select FIPS-approved
-  algorithms only (`EVP_default_properties_is_fips_enabled`), which is what
-  RHEL's FIPS mode configures.
-- `kernel_fips`: `/proc/sys/crypto/fips_enabled`; `None` where the file does
-  not exist (a container without `/proc`, a non-Linux host).
+- `provider_fips`: whether rustls reports the installed provider's algorithms
+  as FIPS approved. Provider installation or availability alone is insufficient.
+- `kernel_fips`: the Linux flag at `/proc/sys/crypto/fips_enabled`.
+- `openssl_fips_properties`: the direct result of
+  `EVP_default_properties_is_fips_enabled(NULL)`, exposed by a safe wrapper
+  in the OpenSSL-backed provider. This checks whether the effective default
+  property query selects `fips=yes`. Loading a provider does not establish it;
+  failure of MD5 alone does not establish it either.
+- `crypto_policy`: the classification of `/etc/crypto-policies/config` on
+  supported Linux systems. The base must be exactly `FIPS`; nonempty
+  colon-delimited subpolicies such as `FIPS:OSPP` are accepted. Prefixes such
+  as `FIPSXYZ` and `DEFAULT:FIPS` do not pass. Raw policy contents are not logged.
+- `fips_ready`: true only when every readiness prerequisite is observed and
+  positive, and both provider guards pass.
 
-Set `PRAXIS_REQUIRE_FIPS=1` (also `true`, `yes`, `on`) in production FIPS
-deployments. It is a check, never a switch: praxis-ai then refuses to start
-unless both signals are present, naming each one that is missing, and
-refuses any listener TLS configuration that rustls does not consider
-FIPS-approved. Upstream connections always require Extended Master Secret
-and share the same provider, so they are FIPS whenever the listeners are.
-Without the variable praxis-ai starts either way and only logs the status.
+Each observation distinguishes `Observed`, `Unsupported`, `Missing`,
+`ReadFailed` (with the I/O error category), and `Invalid`. Non-Linux system
+checks and OpenSSL versions without the default-property API are unsupported.
+A Linux distribution without crypto-policies has a missing policy signal.
+Neither situation can report positive readiness.
+
+Set `PRAXIS_REQUIRE_FIPS=1` (also `true`, `yes`, `on`) for the compliance
+profile. Any failed, missing, unreadable, invalid, or unsupported prerequisite
+**exits with status 1 before serving traffic**, including `--validate` and
+`--dump`. The error names every failed prerequisite, its fixed path or API,
+and an action to check host configuration, without displaying file contents.
+The application follows the host's crypto policy: it never loads an OpenSSL
+provider, enables host FIPS mode, or changes the default property query.
+Listener TLS configuration and registered non-FIPS filters remain subject to
+the existing guards. Upstream connections still require Extended Master Secret.
+
+Without the variable (or with an off value such as `false`), ordinary startup
+continues, logs `fips_ready=false` when applicable, and emits a diagnostic for
+every failed prerequisite. This startup observation is not an HTTP readiness
+endpoint and does not constitute formal certification. See the minimal
+[FIPS readiness example](../examples/configs/fips-readiness.yaml) for invocation.
 
 The requirement also covers what the binary itself carries: a build that
 registers a filter whose dependencies do their own cryptography outside the
@@ -98,7 +122,7 @@ podman run --rm -e PRAXIS_REQUIRE_FIPS=1 ghcr.io/praxis-proxy/ai:0.3.0-fips
 On a host that is not in FIPS mode this exits immediately with
 
 ```text
-fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL provider does not report FIPS-approved algorithms (is the fips provider active?); the kernel is not in FIPS mode (/proc/sys/crypto/fips_enabled is 0)
+fatal: PRAXIS_REQUIRE_FIPS is set but FIPS mode is not in effect: the OpenSSL provider does not report FIPS-approved algorithms; OpenSSL effective default properties (EVP_default_properties_is_fips_enabled): not enabled; verify OpenSSL 3 and the host OpenSSL configuration select fips=yes; kernel FIPS flag (/proc/sys/crypto/fips_enabled): not enabled; verify host FIPS setup and the container's /proc mount; system crypto policy (/etc/crypto-policies/config): not enabled; verify a supported crypto-policies installation selects the FIPS base policy
 ```
 
 ## What changes under FIPS mode
@@ -178,8 +202,9 @@ podman run --rm -e PRAXIS_REQUIRE_FIPS=1 --entrypoint praxis-ai \
 ```
 
 The second command validates the built-in configuration (pass `-c` with a
-mounted file to validate yours) and exits 0 only when the provider and the
-kernel both report FIPS mode; it prints nothing in that case. The listener
+mounted file to validate yours) and exits 0 only when the provider guards
+and every runtime readiness prerequisite pass; it prints nothing in that
+case. The listener
 TLS configurations are checked, and the startup line above is logged, when
 the real workload starts, so run it the same way with `PRAXIS_REQUIRE_FIPS=1`
 and keep that line as evidence.

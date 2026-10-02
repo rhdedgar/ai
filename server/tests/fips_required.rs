@@ -16,22 +16,24 @@
 
 use std::process::Command;
 
-/// Whether both FIPS signals the binary checks are present: the kernel flag
-/// and an OpenSSL provider that reports FIPS-approved algorithms.
+/// Whether provider guards and all runtime readiness prerequisites pass.
 fn host_is_fips() -> bool {
     praxis_tls::provider::install();
-    praxis_tls::provider::status().unmet().is_empty()
+    let status = praxis_tls::provider::status();
+    status.installed && status.provider_fips && praxis_ai_apis::crypto_readiness::CryptoReadiness::check().fips_ready()
 }
 
 /// Run `praxis-ai --validate` on the built-in default config with the given
 /// environment, returning (success, stderr).
-#[expect(
-    clippy::expect_used,
-    reason = "a test helper; a binary that cannot run is a test failure"
-)]
 fn validate_with(env: &[(&str, &str)]) -> (bool, String) {
+    cli_with("--validate", env)
+}
+
+/// Run a configuration-only command with an isolated environment.
+#[expect(clippy::expect_used, reason = "a binary that cannot run is a test failure")]
+fn cli_with(argument: &str, env: &[(&str, &str)]) -> (bool, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_praxis-ai"));
-    command.arg("--validate");
+    command.arg(argument);
     command.env_remove("PRAXIS_REQUIRE_FIPS");
     command.env_remove("PRAXIS_CONFIG");
     for (key, value) in env {
@@ -44,7 +46,7 @@ fn validate_with(env: &[(&str, &str)]) -> (bool, String) {
     )
 }
 
-/// On a FIPS host both signals are present, so validate succeeds unless the
+/// On a FIPS host every prerequisite is present, so validate succeeds unless the
 /// binary registers a filter whose dependencies carry their own
 /// cryptography, which must be refused by name.
 fn assert_fips_host_outcome(ok: bool, stderr: &str) {
@@ -90,6 +92,12 @@ fn require_fips_fails_closed_unless_the_host_is_in_fips_mode() {
     if host_is_fips() {
         assert_fips_host_outcome(ok, &stderr);
     } else {
+        for failure in praxis_ai_apis::crypto_readiness::CryptoReadiness::check().unmet() {
+            assert!(
+                stderr.contains(&failure.to_string()),
+                "missing prerequisite diagnostic {failure}: {stderr}"
+            );
+        }
         assert!(
             !ok,
             "on a non-FIPS host the requirement is unmet and the binary must refuse to start"
@@ -99,7 +107,9 @@ fn require_fips_fails_closed_unless_the_host_is_in_fips_mode() {
             "the refusal must name the variable and say FIPS mode is not in effect, got: {stderr}"
         );
         assert!(
-            stderr.contains("kernel is not in FIPS mode") || stderr.contains("OpenSSL provider"),
+            stderr.contains("kernel FIPS flag")
+                || stderr.contains("OpenSSL provider")
+                || stderr.contains("crypto policy"),
             "the refusal must say which signal is missing, got: {stderr}"
         );
     }
@@ -113,4 +123,20 @@ fn require_fips_fails_closed_unless_the_host_is_in_fips_mode() {
 fn a_false_value_does_not_require_fips() {
     let (ok, stderr) = validate_with(&[("PRAXIS_REQUIRE_FIPS", "false")]);
     assert!(ok, "PRAXIS_REQUIRE_FIPS=false must not require FIPS: {stderr}");
+}
+
+#[test]
+#[expect(clippy::tests_outside_test_module, reason = "integration test target")]
+fn dump_obeys_the_same_strict_readiness_requirement() {
+    let (control_ok, control_err) = cli_with("--dump", &[]);
+    assert!(control_ok, "ordinary dump succeeds: {control_err}");
+    let (ok, stderr) = cli_with("--dump", &[("PRAXIS_REQUIRE_FIPS", "1")]);
+    if host_is_fips() {
+        assert_fips_host_outcome(ok, &stderr);
+    } else {
+        assert!(!ok, "strict dump must refuse an unready host");
+        for failure in praxis_ai_apis::crypto_readiness::CryptoReadiness::check().unmet() {
+            assert!(stderr.contains(&failure.to_string()), "{failure}: {stderr}");
+        }
+    }
 }

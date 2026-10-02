@@ -71,6 +71,7 @@ praxis-core = { workspace = true }
 praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
 regex = { workspace = true }
+rustls_openssl = { workspace = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

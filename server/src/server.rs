@@ -94,6 +94,7 @@ fn boot_server(
     config_path: Option<PathBuf>,
 ) -> ! {
     install_crypto_provider();
+    log_crypto_readiness();
     if praxis_tls::provider::required()
         && let Some(reason) = fips_blocker(&registry)
     {
@@ -618,9 +619,10 @@ pub fn fips_blocker(registry: &FilterRegistry) -> Option<String> {
 /// Call it before anything that might build a TLS configuration, including
 /// `--validate` and `--dump`. With `PRAXIS_REQUIRE_FIPS` set the process
 /// refuses to start unless FIPS mode is in effect (the provider reports
-/// FIPS-approved algorithms and the kernel flag is on), naming each missing
-/// signal. It is a check, never a switch: FIPS mode comes from the host, and
-/// praxis-ai never enables a provider on its own.
+/// FIPS-approved algorithms, the kernel flag is on, and the system crypto
+/// policy is FIPS), naming each missing signal. It is a check, never a
+/// switch: FIPS mode comes from the host, and praxis-ai never enables a
+/// provider on its own.
 pub fn install_crypto_provider() {
     praxis_tls::provider::install();
 
@@ -632,24 +634,66 @@ pub fn install_crypto_provider() {
     }
 
     let status = praxis_tls::provider::status();
+    let readiness = praxis_ai_apis::crypto_readiness::CryptoReadiness::check();
+    if let Err(unmet) = crypto_startup_decision(praxis_tls::provider::required(), &status, readiness) {
+        fatal(&format!(
+            "{} is set but FIPS mode is not in effect: {}",
+            praxis_tls::provider::REQUIRE_FIPS_ENV,
+            unmet.join("; ")
+        ));
+    }
+}
+
+/// Report readiness once tracing is available during server bootstrap.
+fn log_crypto_readiness() {
+    let status = praxis_tls::provider::status();
+    let readiness = praxis_ai_apis::crypto_readiness::CryptoReadiness::check();
+    let failures = crypto_startup_failures(&status, readiness);
     info!(
         provider = status.name,
         provider_fips = status.provider_fips,
-        kernel_fips = ?status.kernel_fips,
+        kernel_fips = ?readiness.kernel_fips,
+        openssl_fips_properties = ?readiness.openssl_fips_properties,
+        crypto_policy = ?readiness.crypto_policy,
+        fips_ready = readiness.fips_ready() && status.installed && status.provider_fips,
         fips_required = praxis_tls::provider::required(),
         "installed rustls crypto provider"
     );
-
-    if praxis_tls::provider::required() {
-        let unmet = status.unmet();
-        if !unmet.is_empty() {
-            fatal(&format!(
-                "{} is set but FIPS mode is not in effect: {}",
-                praxis_tls::provider::REQUIRE_FIPS_ENV,
-                unmet.join("; ")
-            ));
-        }
+    for reason in failures {
+        tracing::warn!(%reason, "crypto readiness prerequisite failed");
     }
+}
+
+/// Pure startup policy: strict mode rejects every failure, including unsupported
+/// and missing checks; ordinary mode permits startup with diagnostics.
+fn crypto_startup_decision(
+    required: bool,
+    status: &praxis_tls::provider::Status,
+    readiness: praxis_ai_apis::crypto_readiness::CryptoReadiness,
+) -> Result<(), Vec<String>> {
+    let failures = crypto_startup_failures(status, readiness);
+    if required && !failures.is_empty() {
+        Err(failures)
+    } else {
+        Ok(())
+    }
+}
+
+/// Keep provider guards, but use the readiness interface as the source of host
+/// policy and effective-property failures instead of filtering diagnostic text.
+fn crypto_startup_failures(
+    status: &praxis_tls::provider::Status,
+    readiness: praxis_ai_apis::crypto_readiness::CryptoReadiness,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    if !status.installed {
+        failures.push("the OpenSSL-backed rustls crypto provider is not installed".to_owned());
+    }
+    if !status.provider_fips {
+        failures.push("the OpenSSL provider does not report FIPS-approved algorithms".to_owned());
+    }
+    failures.extend(readiness.unmet().into_iter().map(|failure| failure.to_string()));
+    failures
 }
 
 /// Print a fatal error to stderr and exit the process.
@@ -754,6 +798,95 @@ mod tests {
         );
         super::install_crypto_provider();
         assert!(praxis_tls::provider::installed(), "installing again is harmless");
+    }
+
+    #[test]
+    fn strict_startup_requires_every_observed_prerequisite() {
+        use std::io::ErrorKind;
+
+        use praxis_ai_apis::crypto_readiness::{CryptoPolicy, CryptoReadiness, ReadinessSignal};
+
+        let status = praxis_tls::provider::Status {
+            name: "openssl",
+            installed: true,
+            kernel_fips: Some(true),
+            provider_fips: true,
+        };
+        let ready = CryptoReadiness {
+            crypto_policy: ReadinessSignal::Observed(CryptoPolicy::Fips),
+            kernel_fips: ReadinessSignal::Observed(true),
+            openssl_fips_properties: ReadinessSignal::Observed(true),
+        };
+        assert!(super::crypto_startup_decision(true, &status, ready).is_ok());
+        for signal in [
+            ReadinessSignal::Observed(false),
+            ReadinessSignal::Unsupported,
+            ReadinessSignal::Missing,
+            ReadinessSignal::ReadFailed(ErrorKind::PermissionDenied),
+            ReadinessSignal::Invalid,
+        ] {
+            for failed in [
+                CryptoReadiness {
+                    kernel_fips: signal,
+                    ..ready
+                },
+                CryptoReadiness {
+                    openssl_fips_properties: signal,
+                    ..ready
+                },
+            ] {
+                assert!(
+                    super::crypto_startup_decision(true, &status, failed).is_err(),
+                    "{failed:?}"
+                );
+                assert!(
+                    super::crypto_startup_decision(false, &status, failed).is_ok(),
+                    "ordinary startup remains available"
+                );
+            }
+        }
+        for signal in [
+            ReadinessSignal::Observed(CryptoPolicy::Other),
+            ReadinessSignal::Unsupported,
+            ReadinessSignal::Missing,
+            ReadinessSignal::ReadFailed(ErrorKind::PermissionDenied),
+            ReadinessSignal::Invalid,
+        ] {
+            let failed = CryptoReadiness {
+                crypto_policy: signal,
+                ..ready
+            };
+            assert!(
+                super::crypto_startup_decision(true, &status, failed).is_err(),
+                "{failed:?}"
+            );
+            assert!(super::crypto_startup_decision(false, &status, failed).is_ok());
+        }
+        let failed = CryptoReadiness {
+            crypto_policy: ReadinessSignal::Missing,
+            kernel_fips: ReadinessSignal::Invalid,
+            openssl_fips_properties: ReadinessSignal::Observed(false),
+        };
+        let reasons = super::crypto_startup_decision(true, &status, failed).expect_err("all prerequisites fail");
+        assert_eq!(reasons.len(), 3, "all independent diagnostics are retained");
+        assert!(reasons.iter().any(|reason| reason.contains("EVP_default_properties")));
+        assert!(reasons.iter().any(|reason| reason.contains("missing")));
+        assert!(reasons.iter().any(|reason| reason.contains("invalid")));
+        for guarded in [
+            praxis_tls::provider::Status {
+                installed: false,
+                ..status
+            },
+            praxis_tls::provider::Status {
+                provider_fips: false,
+                ..status
+            },
+        ] {
+            assert!(
+                super::crypto_startup_decision(true, &guarded, ready).is_err(),
+                "provider guards remain required"
+            );
+        }
     }
 
     #[test]
