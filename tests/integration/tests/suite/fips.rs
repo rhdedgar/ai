@@ -676,14 +676,15 @@ fn the_binary_serves_under_require_fips_exactly_on_a_fips_host() {
             for field in [
                 "provider=\"openssl\"",
                 "provider_fips=true",
-                "kernel_fips=Some(true)",
-                "openssl_fips_properties=true",
+                "kernel_fips=Observed(true)",
+                "openssl_fips_properties=Observed(true)",
+                "fips_ready=true",
                 "fips_required=true",
             ] {
                 assert!(line.contains(field), "the status line lacks {field}: {line}");
             }
             assert!(
-                line.contains("crypto_policy=Some(\"FIPS"),
+                line.contains("crypto_policy=Observed(Fips)"),
                 "the status line must show a FIPS crypto policy: {line}"
             );
         },

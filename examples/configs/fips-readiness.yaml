@@ -1,0 +1,27 @@
+# FIPS Readiness
+#
+# Require effective OpenSSL FIPS defaults, the kernel flag, and the system
+# FIPS crypto policy before starting. Use a supported FIPS host and the FIPS
+# build; the application checks host configuration without enabling it.
+#
+# Usage:
+#   make release-fips
+#   PRAXIS_REQUIRE_FIPS=1 target/release/praxis-ai -c examples/configs/fips-readiness.yaml
+#   curl http://127.0.0.1:8080/
+#
+# A failed or unsupported prerequisite exits with status 1, even for
+# --validate and --dump. Without the variable, startup logs readiness and
+# its reasons. This HTTP response is static content, not a readiness API.
+
+listeners:
+  - name: gateway
+    address: "127.0.0.1:8080"
+    filter_chains:
+      - main
+
+filter_chains:
+  - name: main
+    filters:
+      - filter: static_response
+        status: 200
+        body: "fips readiness example"

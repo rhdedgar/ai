@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
+#![forbid(unsafe_code)]
 #![allow(unreachable_pub, reason = "migration: visibility will be tightened")]
 
 //! AI provider API types and persistence for Praxis.

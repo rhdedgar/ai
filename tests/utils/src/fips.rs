@@ -9,7 +9,8 @@
 //! - [`approved_mode`]: does the installed OpenSSL provider offer FIPS-approved algorithms only? That is what decides
 //!   which algorithms a handshake can use, so the FIPS behavior tests key their expectations on it and assert both
 //!   branches, wherever they run.
-//! - [`fips_host`]: is the process in FIPS mode the way a deployment requires it, provider and kernel flag both?
+//! - [`fips_host`]: is the process in FIPS mode the way a deployment requires it, provider guards and all runtime
+//!   readiness prerequisites?
 //!
 //! `PRAXIS_FIPS_HOST=1` declares that the suites are running on a FIPS-enabled
 //! host (`make test-fips-host` sets it). The harness then fails closed the
@@ -42,11 +43,11 @@ pub fn approved_mode() -> bool {
     praxis_tls::provider::status().provider_fips
 }
 
-/// Whether the process is in FIPS mode by both signals: the provider reports
-/// approved algorithms only and the kernel flag reads `1`.
+/// Whether the provider guards and all three runtime readiness signals pass.
 pub fn fips_host() -> bool {
     praxis_tls::provider::install();
-    praxis_tls::provider::status().unmet().is_empty()
+    let status = praxis_tls::provider::status();
+    status.installed && status.provider_fips && praxis_ai_apis::crypto_readiness::CryptoReadiness::check().fips_ready()
 }
 
 /// Panic unless the process is in FIPS mode, when the environment declares
@@ -60,7 +61,17 @@ pub fn assert_fips_host_if_declared() {
     if !fips_host_declared() {
         return;
     }
-    let unmet = praxis_tls::provider::status().unmet();
+    let mut unmet: Vec<String> = praxis_tls::provider::status()
+        .unmet()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    unmet.extend(
+        praxis_ai_apis::crypto_readiness::CryptoReadiness::check()
+            .unmet()
+            .into_iter()
+            .map(|failure| failure.to_string()),
+    );
     assert!(
         unmet.is_empty(),
         "{FIPS_HOST_ENV} is set but the process is not in FIPS mode: {}",

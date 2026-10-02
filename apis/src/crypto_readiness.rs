@@ -1,173 +1,281 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Praxis Contributors
 
-//! Runtime cryptographic readiness checks.
+//! Readiness from effective OpenSSL properties and supported host crypto policy.
 //!
-//! A portable interface that inspects the effective cryptographic state of
-//! the process and the host, independent of the rustls provider abstraction.
-//! The two checks the application performs itself, directly, are:
-//!
-//! 1. **OpenSSL effective default properties** — `EVP_default_properties_is_fips_enabled(NULL)`, the same call the
-//!    rustls-openssl provider uses, called directly by praxis-ai so the check does not depend on the provider
-//!    abstraction.
-//! 2. **System crypto policy** — `/etc/crypto-policies/config` on RHEL and derivatives, where a `FIPS` (or `FIPS:*`)
-//!    policy is the operating system's own signal that FIPS mode is fully configured.
-//!
-//! Together with the kernel flag (`/proc/sys/crypto/fips_enabled`) these
-//! form the readiness prerequisites. The module never activates a provider
-//! or changes global state; it queries what the host already configured.
+//! These checks follow host configuration. They never load a provider or change
+//! the default property query, and readiness is not a certification assertion.
 
-/// Path of the kernel's FIPS mode flag.
-const KERNEL_FIPS_FLAG: &str = "/proc/sys/crypto/fips_enabled";
-/// Path of the system crypto policy configuration.
+#[cfg(any(target_os = "linux", test))]
+use std::path::Path;
+use std::{fmt, io::ErrorKind};
+
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/// The RHEL-family system crypto policy configuration.
 const CRYPTO_POLICIES_CONFIG: &str = "/etc/crypto-policies/config";
+/// The Linux kernel's FIPS mode flag.
+const KERNEL_FIPS_FLAG: &str = "/proc/sys/crypto/fips_enabled";
 
-/// The result of a cryptographic readiness check.
-#[derive(Debug, Clone)]
+/// A readiness observation, retaining why a prerequisite is unavailable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadinessSignal<T> {
+    /// Successfully inspected state.
+    Observed(T),
+    /// The platform or library does not support this check.
+    Unsupported,
+    /// The prerequisite's fixed system path does not exist.
+    Missing,
+    /// Reading failed; no file contents are retained.
+    ReadFailed(ErrorKind),
+    /// Malformed or empty contents.
+    Invalid,
+}
+
+/// System policy classification. Raw configuration is deliberately not retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CryptoPolicy {
+    /// The base policy is exactly `FIPS`, optionally with subpolicies.
+    Fips,
+    /// A valid policy with a different base.
+    Other,
+}
+
+/// The three independent readiness prerequisites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CryptoReadiness {
-    /// Whether `EVP_default_properties_is_fips_enabled(NULL)` returns 1.
-    pub openssl_fips_properties: bool,
-    /// The kernel FIPS flag from `/proc/sys/crypto/fips_enabled`.
-    /// `None` when the file does not exist or cannot be read.
-    pub kernel_fips: Option<bool>,
-    /// The system crypto policy from `/etc/crypto-policies/config`.
-    /// `None` on platforms that do not use crypto-policies.
-    pub crypto_policy: Option<String>,
+    /// System crypto policy, detected on Linux through crypto-policies.
+    pub crypto_policy: ReadinessSignal<CryptoPolicy>,
+    /// Linux kernel FIPS mode flag.
+    pub kernel_fips: ReadinessSignal<bool>,
+    /// Direct effective-default-property observation through the safe provider
+    /// wrapper for `EVP_default_properties_is_fips_enabled(NULL)`.
+    pub openssl_fips_properties: ReadinessSignal<bool>,
 }
 
 impl CryptoReadiness {
-    /// Perform all readiness checks and return the result.
-    ///
-    /// Reads the OpenSSL effective default properties, the kernel FIPS
-    /// flag, and the system crypto policy. None of these change global
-    /// state; the calls are pure queries.
+    /// Inspect the effective library state and supported host signals.
     #[must_use]
     pub fn check() -> Self {
+        let openssl_fips_properties = rustls_openssl::fips::default_properties_enabled()
+            .map_or(ReadinessSignal::Unsupported, ReadinessSignal::Observed);
+        let (crypto_policy, kernel_fips) = system_signals();
         Self {
-            openssl_fips_properties: openssl_fips_properties_enabled(),
-            kernel_fips: kernel_fips_flag(),
-            crypto_policy: system_crypto_policy(),
+            crypto_policy,
+            kernel_fips,
+            openssl_fips_properties,
         }
     }
 
-    /// Whether all three FIPS readiness signals are present and positive.
+    /// True only when every prerequisite was observed and is positive.
     #[must_use]
-    pub fn fips_ready(&self) -> bool {
-        self.openssl_fips_properties
-            && self.kernel_fips == Some(true)
-            && self
-                .crypto_policy
-                .as_ref()
-                .is_some_and(|policy| policy.starts_with("FIPS"))
+    pub fn fips_ready(self) -> bool {
+        self.crypto_policy == ReadinessSignal::Observed(CryptoPolicy::Fips)
+            && self.kernel_fips == ReadinessSignal::Observed(true)
+            && self.openssl_fips_properties == ReadinessSignal::Observed(true)
     }
 
-    /// Whether the platform cannot give a definitive readiness answer.
-    ///
-    /// True on non-Linux platforms and on Linux distributions that do not
-    /// use `/etc/crypto-policies/config`, so the readiness check does not
-    /// produce a false positive on Alpine, Debian, or macOS.
+    /// Every failed prerequisite, without configuration contents.
     #[must_use]
-    pub fn unsupported(&self) -> bool {
-        self.kernel_fips.is_none() || self.crypto_policy.is_none()
+    pub fn unmet(self) -> Vec<ReadinessFailure> {
+        [
+            failure(
+                Prerequisite::OpenSslProperties,
+                self.openssl_fips_properties,
+                |enabled| enabled,
+            ),
+            failure(Prerequisite::Kernel, self.kernel_fips, |enabled| enabled),
+            failure(Prerequisite::SystemPolicy, self.crypto_policy, |policy| {
+                policy == CryptoPolicy::Fips
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
-    /// Every prerequisite that is not met, as an operator-facing explanation.
-    ///
-    /// Empty when every signal is present and positive. Each entry names
-    /// the file path or API that failed so the operator knows where to look.
+    /// Whether a required check is unsupported by the platform or library.
+    /// Missing files and read errors remain separate states.
     #[must_use]
-    pub fn unmet(&self) -> Vec<String> {
-        let mut r = Vec::new();
-        if !self.openssl_fips_properties {
-            r.push(
-                "OpenSSL's effective default properties do not select FIPS-approved algorithms \
-                    (EVP_default_properties_is_fips_enabled is 0); is the host in FIPS mode?"
-                    .into(),
-            );
+    pub fn unsupported(self) -> bool {
+        matches!(self.crypto_policy, ReadinessSignal::Unsupported)
+            || matches!(self.kernel_fips, ReadinessSignal::Unsupported)
+            || matches!(self.openssl_fips_properties, ReadinessSignal::Unsupported)
+    }
+}
+
+/// A prerequisite that failed readiness.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Prerequisite {
+    /// The operating system's kernel flag.
+    Kernel,
+    /// The effective OpenSSL default property query.
+    OpenSslProperties,
+    /// The system crypto policy's base selection.
+    SystemPolicy,
+}
+
+/// Why a prerequisite failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FailureReason {
+    /// Observed successfully, but not enabled or not a FIPS base policy.
+    Disabled,
+    /// Invalid or empty file contents.
+    Invalid,
+    /// Missing system path.
+    Missing,
+    /// System path could not be read.
+    ReadFailed(ErrorKind),
+    /// Unsupported platform or OpenSSL API.
+    Unsupported,
+}
+
+/// An actionable failure that contains no configuration contents.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadinessFailure {
+    /// Failed prerequisite.
+    pub prerequisite: Prerequisite,
+    /// Failed observation or negative result.
+    pub reason: FailureReason,
+}
+
+impl fmt::Display for ReadinessFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (label, action) = match self.prerequisite {
+            Prerequisite::Kernel => (
+                KERNEL_FIPS_FLAG,
+                "verify host FIPS setup and the container's /proc mount",
+            ),
+            Prerequisite::OpenSslProperties => (
+                "EVP_default_properties_is_fips_enabled",
+                "verify OpenSSL 3 and the host OpenSSL configuration select fips=yes",
+            ),
+            Prerequisite::SystemPolicy => (
+                CRYPTO_POLICIES_CONFIG,
+                "verify a supported crypto-policies installation selects the FIPS base policy",
+            ),
+        };
+        let prerequisite = match self.prerequisite {
+            Prerequisite::Kernel => "kernel FIPS flag",
+            Prerequisite::OpenSslProperties => "OpenSSL effective default properties",
+            Prerequisite::SystemPolicy => "system crypto policy",
+        };
+        write!(f, "{prerequisite} ({label}): ")?;
+        match self.reason {
+            FailureReason::Disabled => f.write_str("not enabled")?,
+            FailureReason::Invalid => f.write_str("invalid or empty contents")?,
+            FailureReason::Missing => f.write_str("missing")?,
+            FailureReason::ReadFailed(kind) => write!(f, "read failed ({kind:?})")?,
+            FailureReason::Unsupported => f.write_str("unsupported")?,
         }
-        if let Some(false) | None = self.kernel_fips {
-            r.push(kernel_fips_reason(self.kernel_fips));
-        }
-        if !self.crypto_policy.as_ref().is_some_and(|p| p.starts_with("FIPS")) {
-            r.push(crypto_policy_reason(self.crypto_policy.as_deref()));
-        }
-        r
+        write!(f, "; {action}")
     }
 }
 
-/// The operator-facing reason for a missing or negative kernel FIPS flag.
-fn kernel_fips_reason(flag: Option<bool>) -> String {
-    match flag {
-        Some(false) => "the kernel is not in FIPS mode (/proc/sys/crypto/fips_enabled is 0)".into(),
-        None => "the kernel FIPS flag cannot be read (/proc/sys/crypto/fips_enabled is absent); \
-                 this platform may not support FIPS readiness checks"
-            .into(),
-        Some(true) => String::new(),
-    }
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+/// Classify an observation without erasing its failure state.
+fn failure<T>(
+    prerequisite: Prerequisite,
+    signal: ReadinessSignal<T>,
+    positive: impl FnOnce(T) -> bool,
+) -> Option<ReadinessFailure> {
+    let reason = match signal {
+        ReadinessSignal::Observed(value) => {
+            if positive(value) {
+                return None;
+            }
+            FailureReason::Disabled
+        },
+        ReadinessSignal::Unsupported => FailureReason::Unsupported,
+        ReadinessSignal::Missing => FailureReason::Missing,
+        ReadinessSignal::ReadFailed(kind) => FailureReason::ReadFailed(kind),
+        ReadinessSignal::Invalid => FailureReason::Invalid,
+    };
+    Some(ReadinessFailure { prerequisite, reason })
 }
 
-/// The operator-facing reason for a missing or non-FIPS crypto policy.
-fn crypto_policy_reason(policy: Option<&str>) -> String {
-    match policy {
-        Some(p) => format!("the system crypto policy is {p:?}, not FIPS (/etc/crypto-policies/config)"),
-        None => "the system crypto policy cannot be read (/etc/crypto-policies/config is absent); \
-                 this platform may not support system crypto policies"
-            .into(),
-    }
-}
-
-/// Whether OpenSSL's effective default properties select FIPS-approved
-/// algorithms only, checked directly through the C API.
-///
-/// This is `EVP_default_properties_is_fips_enabled(NULL)`, the same
-/// function the host's OpenSSL configuration controls. The application
-/// does not set this property; it reads what the host configured.
-#[cfg(ossl300)]
-fn openssl_fips_properties_enabled() -> bool {
-    #[expect(
-        unsafe_code,
-        reason = "direct FFI query of OpenSSL's effective FIPS property; \
-                  no state mutation, documented thread-safe after init"
-    )]
-    // SAFETY: `EVP_default_properties_is_fips_enabled` with a NULL context
-    // queries the global default library context. It is a pure read of
-    // process-global state that OpenSSL documents as thread-safe after
-    // library initialization, which `openssl::init()` ensures.
-    unsafe {
-        openssl::init();
-        openssl_sys::EVP_default_properties_is_fips_enabled(std::ptr::null_mut()) == 1
-    }
-}
-
-#[cfg(not(ossl300))]
-fn openssl_fips_properties_enabled() -> bool {
-    false
-}
-
-/// The kernel FIPS flag, or `None` when the file cannot be read.
-fn kernel_fips_flag() -> Option<bool> {
-    let contents = std::fs::read_to_string(KERNEL_FIPS_FLAG).ok()?;
-    match contents.trim() {
-        "1" => Some(true),
-        "0" => Some(false),
-        _ => None,
-    }
-}
-
-/// The active system crypto policy, or `None` on platforms without
-/// crypto-policies support.
-fn system_crypto_policy() -> Option<String> {
-    let contents = std::fs::read_to_string(CRYPTO_POLICIES_CONFIG).ok()?;
-    crypto_policy_from(&contents)
-}
-
-/// The first non-comment, non-blank line from a crypto-policies config.
-fn crypto_policy_from(contents: &str) -> Option<String> {
-    contents
+/// Parse exactly one policy selection, with nonempty colon-delimited names.
+/// Prefix lookalikes and another policy's FIPS subpolicy are negative.
+#[cfg(any(target_os = "linux", test))]
+fn crypto_policy_from(contents: &str) -> ReadinessSignal<CryptoPolicy> {
+    let mut lines = contents
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_owned)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(policy) = lines.next() else {
+        return ReadinessSignal::Invalid;
+    };
+    if lines.next().is_some() {
+        return ReadinessSignal::Invalid;
+    }
+    let mut names = policy.split(':');
+    let base = names.next().unwrap_or_default();
+    let valid_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    if !valid_name(base) || !names.all(valid_name) {
+        return ReadinessSignal::Invalid;
+    }
+    ReadinessSignal::Observed(if base == "FIPS" {
+        CryptoPolicy::Fips
+    } else {
+        CryptoPolicy::Other
+    })
+}
+
+/// Parse the kernel flag strictly.
+#[cfg(any(target_os = "linux", test))]
+fn kernel_flag_from(contents: &str) -> ReadinessSignal<bool> {
+    match contents.trim() {
+        "1" => ReadinessSignal::Observed(true),
+        "0" => ReadinessSignal::Observed(false),
+        _ => ReadinessSignal::Invalid,
+    }
+}
+
+/// Preserve filesystem failure categories, including invalid UTF-8.
+#[cfg(any(target_os = "linux", test))]
+fn read_signal<T>(path: &Path, parse: impl FnOnce(&str) -> ReadinessSignal<T>) -> ReadinessSignal<T> {
+    signal_from_read(std::fs::read_to_string(path), parse)
+}
+
+/// Separate I/O classification from filesystem access for deterministic tests.
+#[cfg(any(target_os = "linux", test))]
+fn signal_from_read<T>(
+    result: std::io::Result<String>,
+    parse: impl FnOnce(&str) -> ReadinessSignal<T>,
+) -> ReadinessSignal<T> {
+    match result {
+        Ok(contents) => parse(&contents),
+        Err(error) => match error.kind() {
+            ErrorKind::NotFound => ReadinessSignal::Missing,
+            ErrorKind::InvalidData => ReadinessSignal::Invalid,
+            kind => ReadinessSignal::ReadFailed(kind),
+        },
+    }
+}
+
+/// Platform-specific system policy detection; unsupported targets cannot pass.
+fn system_signals() -> (ReadinessSignal<CryptoPolicy>, ReadinessSignal<bool>) {
+    #[cfg(target_os = "linux")]
+    {
+        (
+            read_signal(Path::new(CRYPTO_POLICIES_CONFIG), crypto_policy_from),
+            read_signal(Path::new(KERNEL_FIPS_FLAG), kernel_flag_from),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        (ReadinessSignal::Unsupported, ReadinessSignal::Unsupported)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -175,137 +283,242 @@ fn crypto_policy_from(contents: &str) -> Option<String> {
 // -----------------------------------------------------------------------------
 
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test fixture failures must stop the test")]
 mod tests {
     use super::*;
 
     #[test]
-    fn check_returns_a_populated_result() {
-        openssl::init();
-        let readiness = CryptoReadiness::check();
-        assert!(
-            readiness.kernel_fips.is_some() || readiness.kernel_fips.is_none(),
-            "kernel_fips is populated (Some or None is fine)"
-        );
+    #[expect(
+        clippy::too_many_lines,
+        reason = "table checks every failure state across all prerequisites"
+    )]
+    fn every_signal_is_required_and_every_failure_is_retained() {
+        let ready = ready();
+        assert!(ready.fips_ready(), "all positive signals pass");
+        assert!(!ready.unsupported(), "all signals are supported");
+        for signal in [
+            ReadinessSignal::Observed(false),
+            ReadinessSignal::Unsupported,
+            ReadinessSignal::Missing,
+            ReadinessSignal::ReadFailed(ErrorKind::PermissionDenied),
+            ReadinessSignal::Invalid,
+        ] {
+            for observation in [
+                CryptoReadiness {
+                    kernel_fips: signal,
+                    ..ready
+                },
+                CryptoReadiness {
+                    openssl_fips_properties: signal,
+                    ..ready
+                },
+            ] {
+                assert!(!observation.fips_ready(), "{observation:?}");
+                assert_eq!(observation.unmet().len(), 1, "{observation:?}");
+                assert_eq!(
+                    observation.unsupported(),
+                    matches!(signal, ReadinessSignal::Unsupported)
+                );
+            }
+        }
+        for signal in [
+            ReadinessSignal::Observed(CryptoPolicy::Other),
+            ReadinessSignal::Unsupported,
+            ReadinessSignal::Missing,
+            ReadinessSignal::ReadFailed(ErrorKind::PermissionDenied),
+            ReadinessSignal::Invalid,
+        ] {
+            let observation = CryptoReadiness {
+                crypto_policy: signal,
+                ..ready
+            };
+            assert!(!observation.fips_ready(), "{observation:?}");
+            assert_eq!(observation.unmet().len(), 1, "{observation:?}");
+            assert_eq!(
+                observation.unsupported(),
+                matches!(signal, ReadinessSignal::Unsupported)
+            );
+        }
+        let failed = CryptoReadiness {
+            crypto_policy: ReadinessSignal::Missing,
+            kernel_fips: ReadinessSignal::Invalid,
+            openssl_fips_properties: ReadinessSignal::Observed(false),
+        };
+        assert_eq!(failed.unmet().len(), 3, "all failures are reported together");
     }
 
     #[test]
-    fn the_crypto_policy_parser_extracts_the_first_real_line() {
-        assert_eq!(crypto_policy_from("# comment\n\nFIPS\n").as_deref(), Some("FIPS"));
-        assert_eq!(crypto_policy_from("FIPS:OSPP\n").as_deref(), Some("FIPS:OSPP"));
-        assert_eq!(crypto_policy_from("DEFAULT\n").as_deref(), Some("DEFAULT"));
-        assert_eq!(crypto_policy_from(""), None);
-        assert_eq!(crypto_policy_from("# only comments\n"), None);
+    fn policies_require_an_exact_fips_base_and_valid_subpolicies() {
+        for policy in ["FIPS", "FIPS:OSPP", "FIPS:OSPP:NO-SHA1", " # comment\n\n FIPS \n"] {
+            assert_eq!(
+                crypto_policy_from(policy),
+                ReadinessSignal::Observed(CryptoPolicy::Fips),
+                "{policy:?}"
+            );
+        }
+        for policy in ["DEFAULT", "FIPSXYZ", "FIPS-DRAFT", "DEFAULT:FIPS", "fips"] {
+            assert_eq!(
+                crypto_policy_from(policy),
+                ReadinessSignal::Observed(CryptoPolicy::Other),
+                "{policy:?}"
+            );
+        }
+        for policy in [
+            "",
+            "# comments only\n",
+            "FIPS:",
+            "FIPS::OSPP",
+            "FIPS: OSPP",
+            "FIPS\nDEFAULT",
+            "FIPS#secret",
+        ] {
+            assert_eq!(crypto_policy_from(policy), ReadinessSignal::Invalid, "{policy:?}");
+        }
     }
 
     #[test]
-    fn unmet_reports_every_failed_prerequisite() {
-        let all_failing = CryptoReadiness {
-            openssl_fips_properties: false,
-            kernel_fips: Some(false),
-            crypto_policy: Some("DEFAULT".to_owned()),
-        };
-        let reasons = all_failing.unmet();
-        assert!(reasons.len() >= 3, "three checks fail: {reasons:?}");
-        assert!(reasons.iter().any(|r| r.contains("EVP_default_properties")));
-        assert!(reasons.iter().any(|r| r.contains("kernel")));
-        assert!(reasons.iter().any(|r| r.contains("crypto policy")));
-    }
-
-    #[test]
-    fn unmet_is_empty_when_all_checks_pass() {
-        let all_passing = CryptoReadiness {
-            openssl_fips_properties: true,
-            kernel_fips: Some(true),
-            crypto_policy: Some("FIPS".to_owned()),
-        };
-        assert!(all_passing.unmet().is_empty());
-    }
-
-    #[test]
-    fn fips_policy_variants_are_accepted() {
-        let fips_ospp = CryptoReadiness {
-            openssl_fips_properties: true,
-            kernel_fips: Some(true),
-            crypto_policy: Some("FIPS:OSPP".to_owned()),
-        };
-        assert!(fips_ospp.fips_ready(), "FIPS:OSPP is a FIPS policy");
-        assert!(fips_ospp.unmet().is_empty());
-    }
-
-    #[test]
-    fn fips_ready_requires_all_three_signals() {
-        let missing_kernel = CryptoReadiness {
-            openssl_fips_properties: true,
-            kernel_fips: None,
-            crypto_policy: Some("FIPS".to_owned()),
-        };
-        assert!(!missing_kernel.fips_ready());
-
-        let missing_policy = CryptoReadiness {
-            openssl_fips_properties: true,
-            kernel_fips: Some(true),
-            crypto_policy: None,
-        };
-        assert!(!missing_policy.fips_ready());
-
-        let missing_evp = CryptoReadiness {
-            openssl_fips_properties: false,
-            kernel_fips: Some(true),
-            crypto_policy: Some("FIPS".to_owned()),
-        };
-        assert!(!missing_evp.fips_ready());
-    }
-
-    #[test]
-    fn unsupported_is_true_when_signals_are_absent() {
-        let no_kernel = CryptoReadiness {
-            openssl_fips_properties: false,
-            kernel_fips: None,
-            crypto_policy: None,
-        };
-        assert!(no_kernel.unsupported());
-
-        let no_policy = CryptoReadiness {
-            openssl_fips_properties: true,
-            kernel_fips: Some(true),
-            crypto_policy: None,
-        };
-        assert!(no_policy.unsupported());
-    }
-
-    #[test]
-    fn unsupported_is_false_on_a_fully_instrumented_host() {
-        let linux = CryptoReadiness {
-            openssl_fips_properties: false,
-            kernel_fips: Some(false),
-            crypto_policy: Some("DEFAULT".to_owned()),
-        };
-        assert!(!linux.unsupported());
-    }
-
-    #[test]
-    fn the_direct_evp_check_agrees_with_the_provider() {
-        praxis_tls::provider::install();
-        let provider_fips = praxis_tls::provider::status().provider_fips;
-        let direct = openssl_fips_properties_enabled();
+    fn file_observations_preserve_missing_invalid_and_io_failures() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("policy");
+        assert_eq!(read_signal(&path, crypto_policy_from), ReadinessSignal::Missing);
+        for (contents, expected) in [
+            ("FIPS", ReadinessSignal::Observed(CryptoPolicy::Fips)),
+            ("FIPS:OSPP", ReadinessSignal::Observed(CryptoPolicy::Fips)),
+            ("DEFAULT", ReadinessSignal::Observed(CryptoPolicy::Other)),
+            ("FIPSXYZ", ReadinessSignal::Observed(CryptoPolicy::Other)),
+            ("", ReadinessSignal::Invalid),
+            ("# comment", ReadinessSignal::Invalid),
+        ] {
+            std::fs::write(&path, contents).expect("write policy fixture");
+            assert_eq!(read_signal(&path, crypto_policy_from), expected, "{contents:?}");
+        }
+        std::fs::write(&path, [0xFF]).expect("write invalid UTF-8");
+        assert_eq!(read_signal(&path, crypto_policy_from), ReadinessSignal::Invalid);
         assert_eq!(
-            direct, provider_fips,
-            "the direct EVP_default_properties_is_fips_enabled call must agree \
-             with the provider's report"
+            signal_from_read(
+                Err(std::io::Error::from(ErrorKind::PermissionDenied)),
+                crypto_policy_from
+            ),
+            ReadinessSignal::ReadFailed(ErrorKind::PermissionDenied)
         );
     }
 
-    /// With `PRAXIS_TEST_FIPS_PROVIDER` set, the direct EVP check must
-    /// report true and all readiness signals must be positive.
     #[test]
-    fn fips_provider_is_fully_ready_when_the_run_requires_it() {
-        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_none() {
+    fn kernel_values_are_strict() {
+        assert_eq!(kernel_flag_from(" 1\n"), ReadinessSignal::Observed(true));
+        assert_eq!(kernel_flag_from("0\n"), ReadinessSignal::Observed(false));
+        for value in ["", "2", "true", "1\n0"] {
+            assert_eq!(kernel_flag_from(value), ReadinessSignal::Invalid, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn diagnostics_name_every_prerequisite_and_failure_without_file_contents() {
+        for prerequisite in [
+            Prerequisite::Kernel,
+            Prerequisite::OpenSslProperties,
+            Prerequisite::SystemPolicy,
+        ] {
+            for reason in [
+                FailureReason::Disabled,
+                FailureReason::Invalid,
+                FailureReason::Missing,
+                FailureReason::ReadFailed(ErrorKind::PermissionDenied),
+                FailureReason::Unsupported,
+            ] {
+                let message = ReadinessFailure { prerequisite, reason }.to_string();
+                assert!(message.contains("verify"), "{message}");
+                assert!(
+                    message.contains(match prerequisite {
+                        Prerequisite::Kernel => KERNEL_FIPS_FLAG,
+                        Prerequisite::OpenSslProperties => "EVP_default_properties_is_fips_enabled",
+                        Prerequisite::SystemPolicy => CRYPTO_POLICIES_CONFIG,
+                    }),
+                    "{message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn check_uses_the_direct_effective_property_query() {
+        let readiness = CryptoReadiness::check();
+        assert_eq!(
+            readiness.openssl_fips_properties,
+            rustls_openssl::fips::default_properties_enabled()
+                .map_or(ReadinessSignal::Unsupported, ReadinessSignal::Observed)
+        );
+        if std::env::var_os("PRAXIS_TEST_FIPS_PROVIDER").is_some() {
+            assert_eq!(
+                readiness.openssl_fips_properties,
+                ReadinessSignal::Observed(true),
+                "the declared FIPS-provider run must have effective fips=yes"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_properties_follow_process_configuration() {
+        if rustls_openssl::fips::default_properties_enabled().is_none() {
+            assert_eq!(
+                CryptoReadiness::check().openssl_fips_properties,
+                ReadinessSignal::Unsupported
+            );
             return;
         }
+        let directory = tempfile::tempdir().expect("isolated OpenSSL config");
+        let config = directory.path().join("openssl.cnf");
+        for selected in ["yes", "no"] {
+            std::fs::write(&config, format!("openssl_conf = init\n[init]\nalg_section = properties\n[properties]\ndefault_properties = fips={selected}\n"))
+                .expect("write effective property selection");
+            let output = std::process::Command::new(std::env::current_exe().expect("unit test binary"))
+                .args(["--exact", "crypto_readiness::tests::effective_properties_child"])
+                .env("OPENSSL_CONF", &config)
+                .env("PRAXIS_READINESS_EXPECTED", selected)
+                .output()
+                .expect("isolated readiness process");
+            assert!(
+                output.status.success(),
+                "fips={selected}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn effective_properties_child() {
+        let Ok(selected) = std::env::var("PRAXIS_READINESS_EXPECTED") else {
+            return;
+        };
         let readiness = CryptoReadiness::check();
-        assert!(
+        assert_eq!(
             readiness.openssl_fips_properties,
-            "EVP_default_properties_is_fips_enabled must be 1 under PRAXIS_TEST_FIPS_PROVIDER"
+            ReadinessSignal::Observed(selected == "yes"),
+            "the application must inspect the effective configuration"
         );
+        if selected == "no" {
+            assert!(!readiness.fips_ready(), "disabled properties cannot pass readiness");
+            assert!(
+                readiness
+                    .unmet()
+                    .iter()
+                    .any(|failure| failure.prerequisite == Prerequisite::OpenSslProperties),
+                "the direct-property failure is reported"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Test Utilities
+    // -------------------------------------------------------------------------
+
+    /// A supported host with every prerequisite enabled.
+    fn ready() -> CryptoReadiness {
+        CryptoReadiness {
+            crypto_policy: ReadinessSignal::Observed(CryptoPolicy::Fips),
+            kernel_fips: ReadinessSignal::Observed(true),
+            openssl_fips_properties: ReadinessSignal::Observed(true),
+        }
     }
 }

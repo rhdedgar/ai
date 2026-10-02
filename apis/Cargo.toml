@@ -54,7 +54,6 @@ futures = { workspace = true }
 http = { workspace = true }
 jsonschema = { workspace = true, optional = true }
 openssl = { workspace = true }
-openssl-sys = { workspace = true }
 percent-encoding = { workspace = true }
 pingora-core = { workspace = true }
 praxis-ai-store = { workspace = true }
@@ -72,6 +71,7 @@ praxis-core = { workspace = true }
 praxis-filter = { workspace = true, features = ["iterative-request-router", "bound-upstream-request-body", "chain-binding"] }
 praxis-tls = { workspace = true }
 regex = { workspace = true }
+rustls_openssl = { workspace = true }
 rmcp = { workspace = true, optional = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
