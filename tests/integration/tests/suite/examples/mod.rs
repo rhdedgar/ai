@@ -31,6 +31,7 @@ mod file_descriptor_limits;
 mod file_search_callout;
 mod file_search_chat_completions;
 mod file_search_streaming;
+mod fips_readiness;
 #[cfg(feature = "store-sqlite")]
 mod full_flow_agentic;
 #[cfg(feature = "gcp-adc-filter")]

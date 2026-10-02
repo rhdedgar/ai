@@ -52,7 +52,8 @@ object = { version = "0.40.0", default-features = false, features = ["read_core"
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
-openssl-sys = "0.9.117"
+# Safe effective-property inspection in the same provider Praxis installs.
+rustls_openssl = { version = "0.4.2", package = "quixotic-plecostomus-rustls-openssl", default-features = false }
 quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"

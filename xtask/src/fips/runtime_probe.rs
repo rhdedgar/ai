@@ -322,7 +322,7 @@ fn workspace_root() -> PathBuf {
 // Startup Line
 // -----------------------------------------------------------------------------
 
-/// The startup status line, which must report FIPS on both signals.
+/// The startup status line, which must report every prerequisite and positive readiness.
 fn status_line(log: &str) -> Result<String, String> {
     let clean = strip_ansi(log);
     let line = clean
@@ -332,15 +332,16 @@ fn status_line(log: &str) -> Result<String, String> {
     for field in [
         "provider=\"openssl\"",
         "provider_fips=true",
-        "kernel_fips=Some(true)",
-        "openssl_fips_properties=true",
+        "kernel_fips=Observed(true)",
+        "openssl_fips_properties=Observed(true)",
+        "fips_ready=true",
         "fips_required=true",
     ] {
         if !line.contains(field) {
             return Err(format!("the startup status line lacks {field}: {line}"));
         }
     }
-    if !line.contains("crypto_policy=Some(\"FIPS") {
+    if !line.contains("crypto_policy=Observed(Fips)") {
         return Err(format!(
             "the startup status line must show a FIPS crypto policy: {line}"
         ));
@@ -496,13 +497,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_status_line_must_report_fips_on_both_signals() {
+    fn the_status_line_must_report_all_prerequisites_and_readiness() {
         let good = "\u{1b}[2m2026-09-24T00:00:00Z\u{1b}[0m INFO praxis::server: installed rustls crypto provider \
-                    provider=\"openssl\" provider_fips=true kernel_fips=Some(true) \
-                    openssl_fips_properties=true crypto_policy=Some(\"FIPS\") fips_required=true\n";
-        assert!(status_line(good).is_ok_and(|line| line.contains("kernel_fips=Some(true)")));
-        let bad = "installed rustls crypto provider provider=\"openssl\" provider_fips=false kernel_fips=Some(false) \
-                   openssl_fips_properties=false crypto_policy=Some(\"DEFAULT\") fips_required=true\n";
+                    provider=\"openssl\" provider_fips=true kernel_fips=Observed(true) \
+                    openssl_fips_properties=Observed(true) crypto_policy=Observed(Fips) fips_ready=true fips_required=true\n";
+        assert!(status_line(good).is_ok_and(|line| line.contains("kernel_fips=Observed(true)")));
+        for (positive, negative) in [
+            ("fips_ready=true", "fips_ready=false"),
+            ("kernel_fips=Observed(true)", "kernel_fips=Missing"),
+            (
+                "openssl_fips_properties=Observed(true)",
+                "openssl_fips_properties=Unsupported",
+            ),
+            ("crypto_policy=Observed(Fips)", "crypto_policy=Observed(Other)"),
+            ("crypto_policy=Observed(Fips)", "crypto_policy=Missing"),
+        ] {
+            assert!(
+                status_line(&good.replace(positive, negative)).is_err(),
+                "{negative} cannot pass the probe"
+            );
+        }
+        let bad = "installed rustls crypto provider provider=\"openssl\" provider_fips=false kernel_fips=Observed(false) \
+                   openssl_fips_properties=Observed(false) crypto_policy=Observed(Other) fips_required=true\n";
         let err = status_line(bad).expect_err("not FIPS");
         assert!(err.contains("provider_fips=true"), "{err}");
         assert!(status_line("starting server\n").is_err(), "no line at all");
