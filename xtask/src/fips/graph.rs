@@ -8,7 +8,8 @@ use std::process::Command;
 
 use super::report::{Context, Finding, Report};
 
-/// Mirrors check-payload's `rust_denied_crypto` (PR #360) plus openssl-src.
+/// Mirrors check-payload's `rust_denied_crypto` (PR #360) plus openssl-src and
+/// platform-native TLS backends that bypass the system OpenSSL provider.
 pub(crate) const DENIED: &[&str] = &[
     "ring",
     "aws-lc-rs",
@@ -34,6 +35,10 @@ pub(crate) const DENIED: &[&str] = &[
     "x25519-dalek",
     "p256",
     "p384",
+    "native-tls",
+    "security-framework",
+    "security-framework-sys",
+    "schannel",
 ];
 
 /// Where a denied crate usually comes from in this tree.
@@ -62,6 +67,9 @@ fn hint_location(crate_name: &str) -> &'static str {
         "sha1" => "tokio-tungstenite WebSocket accept key (test utilities)",
         "openssl-src" => "the 'vendored' feature of the openssl crate, or OPENSSL_STATIC",
         "boring" | "boring-sys" => "pingora 'boringssl' feature",
+        "native-tls" | "security-framework" | "security-framework-sys" | "schannel" => {
+            "a platform-native TLS backend bypassing rustls-openssl (reqwest/postgres/tungstenite 'native-tls' feature)"
+        },
         _ => "see the dependency path above",
     }
 }
@@ -87,6 +95,10 @@ fn hint_fix(crate_name: &str) -> &'static str {
         "openssl-src" => "remove 'vendored', build with OPENSSL_NO_VENDOR=1, never set OPENSSL_STATIC",
         "boring" | "boring-sys" => "build pingora with the 'rustls' feature only",
         "aws-lc-fips-sys" => "remove the dependency or route it through the system OpenSSL",
+        "native-tls" | "security-framework" | "security-framework-sys" | "schannel" => {
+            "remove the 'native-tls' feature from the dependency that pulls it; all TLS must go through the system \
+             OpenSSL via rustls-openssl"
+        },
         _ => {
             "route the operation through openssl (EVP APIs: openssl::hash, openssl::sign, openssl::pkey) or disable \
              the feature that pulls it"
