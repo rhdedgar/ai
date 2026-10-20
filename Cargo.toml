@@ -52,7 +52,6 @@ object = { version = "0.40.0", default-features = false, features = ["read_core"
 # System OpenSSL bindings, the same crate praxis's rustls provider uses; never
 # with the `vendored` feature, the platform library is the validated module.
 openssl = "0.10.81"
-openssl-sys = "0.9.117"
 quote = "1.0.47"
 rand = "0.10.3"
 rcgen = "0.14.10"
@@ -116,11 +115,11 @@ zstd = "0.14.0"
 # Policy Engine) and the pure-Rust cryptography its plugins carry; praxis-ai
 # forwards that engine through its own `policy-engine` feature instead, on by
 # default and off in the FIPS build (see FIPS_FEATURES in the Makefile).
-praxis-core = { version = "0.7.3", package = "praxis-proxy-core" }
-praxis-filter = { version = "0.7.3", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
-praxis-protocol = { version = "0.7.3", package = "praxis-proxy-protocol" }
+praxis-core = { version = "=0.7.3", package = "praxis-proxy-core" }
+praxis-filter = { version = "=0.7.3", package = "praxis-proxy-filter", default-features = false, features = ["basic-auth-filter"] }
+praxis-protocol = { version = "=0.7.3", package = "praxis-proxy-protocol" }
 praxis-tls = { version = "0.7.3", package = "praxis-proxy-tls" }
-praxis = { version = "0.7.3", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
+praxis = { version = "=0.7.3", package = "praxis-proxy", default-features = false, features = ["config-reload", "admin-api"] }
 praxis-test-utils = { path = "tests/utils", default-features = false }
 
 # AI-owned llm-d ext_proc compatibility layer
@@ -339,3 +338,9 @@ bare_urls = "deny"
 invalid_html_tags = "deny"
 missing_crate_level_docs = "deny"
 private_doc_tests = "allow"
+
+# Temporary: pin praxis-proxy-tls to the commit that includes the FIPS crypto
+# readiness changes (praxis-proxy/praxis#1365). Switch back to a crates.io
+# version once the next praxis release is cut.
+[patch.crates-io]
+praxis-proxy-tls = { git = "https://github.com/praxis-proxy/praxis.git", rev = "60ee753c" }
