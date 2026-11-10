@@ -32,6 +32,15 @@ Before tagging a release:
       missing, skipped, failed, and unfinished evidence as well as successes
 - [ ] If native GPU qualification is desired, dispatch the existing vLLM
       workflow on the final release commit/tag and inspect its report
+- [ ] FIPS compliance evidence is current:
+  - The `fips-host` job succeeded for the release commit (the release
+    workflow's `fips-proof` gate verifies this automatically; a missing or
+    failed run blocks the release unless `skip-fips-proof` is dispatched)
+  - The release CI evidence table shows the FIPS workflow as `success`
+  - The Conversations and Responses mTLS tests ran in `test-postgres-fips-host`
+  - `make fips-deps` passes locally for the release commit
+  - The compliance report (`make fips-check`) shows no new findings
+  - The FIPS host attestation artifact is attached to the fips-host run
 
 ## Tagging a Release
 
